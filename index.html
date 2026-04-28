@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>13F 엑셀 정리기</title>
+  <style>
+    :root {
+      --up: #e8f5e9;
+      --down: #ffebee;
+      --hold: #fffde7;
+      --line: #222;
+    }
+    body {
+      font-family: "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+      margin: 24px;
+      color: #111;
+    }
+    .card {
+      border: 1px solid #ddd;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    input[type="file"] {
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      padding: 8px;
+    }
+    button {
+      border: 0;
+      border-radius: 8px;
+      background: #1b5e20;
+      color: #fff;
+      padding: 10px 14px;
+      cursor: pointer;
+      font-weight: 700;
+    }
+    button:disabled {
+      background: #999;
+      cursor: not-allowed;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      table-layout: fixed;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 6px;
+      text-align: center;
+      vertical-align: top;
+      word-break: keep-all;
+    }
+    thead th {
+      background: #f2f2f2;
+      font-weight: 800;
+    }
+    .up { background: var(--up); }
+    .down { background: var(--down); }
+    .hold { background: var(--hold); }
+    .sector-sep td { border-top: 3px solid #000; }
+    .helper {
+      font-size: 13px;
+      color: #444;
+      line-height: 1.45;
+    }
+  </style>
+</head>
+<body>
+  <h1>13F 리포트 엑셀 정리기</h1>
+  <div class="card">
+    <div class="row">
+      <input id="fileInput" type="file" accept=".xlsx,.xls,.csv" />
+      <button id="downloadBtn" disabled>정리된 엑셀 다운로드</button>
+    </div>
+    <p class="helper">
+      입력 파일에 다음 열이 있으면 자동 인식됩니다: <b>섹터, 티커, 포트폴리오 비중, %변화, 비고, 구분(확대/축소/유지)</b>.<br/>
+      영문 헤더(예: sector, ticker, change, note, action)도 인식하며, 섹터명이 영어면 한국어로 자동 변환합니다(축약/복합 표현 포함).<br/>
+      변화 수치는 퍼센트 셀/일반 숫자를 자동 보정해 `%` 단위로 표기합니다. 티커 뒤 `CALL/PUT`도 자동 표기/비고 반영됩니다.<br/>
+      다운로드 엑셀에 미리보기와 동일한 열 배치의 `미리보기형식` 시트가 함께 생성되며 색상/테두리 구분도 반영됩니다.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>미리보기</h2>
+    <div style="overflow:auto; max-height: 70vh;">
+      <table id="previewTable">
+        <thead>
+          <tr>
+            <th style="width:90px;">섹터</th>
+            <th class="up" style="width:120px;">지분 확대(티커)</th>
+            <th class="up" style="width:100px;">포트 비중(W%)</th>
+            <th class="up" style="width:90px;">% 변화(Δ%)</th>
+            <th class="up" style="width:220px;">비고</th>
+            <th class="down" style="width:120px;">지분 축소(티커)</th>
+            <th class="down" style="width:100px;">포트 비중(W%)</th>
+            <th class="down" style="width:90px;">% 변화(Δ%)</th>
+            <th class="down" style="width:220px;">비고</th>
+            <th class="hold" style="width:120px;">유지(티커)</th>
+            <th class="hold" style="width:100px;">포트 비중(W%)</th>
+            <th class="hold" style="width:220px;">비고</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const previewBody = document.querySelector('#previewTable tbody');
+
+    let currentWorkbook = null;
+    let currentPayload = null;
+
+    const alias = {
+      sector: ['섹터', 'sector', '업종'],
+      ticker: ['티커', 'ticker', 'symbol', '종목'],
+      weight: ['비중', '포트폴리오 비중', 'weight', 'portfolio weight', 'portfolio %', 'wgt'],
+      change: ['%변화', '변화', 'change', '% change', 'pct change'],
+      note: ['비고', 'note', '회사 정보', 'company info', 'description'],
+      action: ['구분', 'action', 'status', '변동유형', 'increase/decrease/hold']
+    };
+
+    const sectorMapKo = {
+      'information technology': '정보기술',
+      'it': '정보기술',
+      'financials': '금융',
+      'financial': '금융',
+      'health care': '헬스케어',
+      'healthcare': '헬스케어',
+      'consumer discretionary': '경기소비재',
+      'consumer staples': '필수소비재',
+      'communication services': '커뮤니케이션 서비스',
+      'communications': '커뮤니케이션 서비스',
+      'telecommunication services': '커뮤니케이션 서비스',
+      'telecommunications': '커뮤니케이션 서비스',
+      'utilities and telecommunications': '유틸리티',
+      'energy': '에너지',
+      'materials': '소재',
+      'industrials': '산업재',
+      'transportation': '산업재',
+      'transports': '산업재',
+      'utilities': '유틸리티',
+      'real estate': '부동산'
+    };
+
+    const sectorKeywordRules = [
+      { ko: '정보기술', keywords: ['information technology', 'technology', 'tech'] },
+      { ko: '금융', keywords: ['financial', 'finance', 'bank', 'insurance'] },
+      { ko: '헬스케어', keywords: ['health care', 'healthcare', 'health', 'pharma', 'biotech'] },
+      { ko: '경기소비재', keywords: ['discretionary', 'consumer cyclical'] },
+      { ko: '필수소비재', keywords: ['staples', 'consumer defensive'] },
+      { ko: '커뮤니케이션 서비스', keywords: ['communication', 'communications', 'telecom', 'telecommunication', 'media'] },
+      { ko: '에너지', keywords: ['energy', 'oil', 'gas'] },
+      { ko: '소재', keywords: ['material', 'materials', 'chemical', 'metals'] },
+      { ko: '산업재', keywords: ['industrial', 'industrials', 'transport', 'transports', 'transportation', 'aerospace'] },
+      { ko: '유틸리티', keywords: ['utility', 'utilities', 'electric', 'water'] },
+      { ko: '부동산', keywords: ['real estate', 'reit', 'reits', 'property'] }
+    ];
+
+    function findHeader(row, candidates) {
+      const normalized = row.map(v => String(v ?? '').trim().toLowerCase());
+      for (const key of candidates) {
+        const idx = normalized.indexOf(key.toLowerCase());
+        if (idx >= 0) return idx;
+      }
+      return -1;
+    }
+
+    function normalizeAction(v) {
+      const t = String(v ?? '').trim().toLowerCase();
+      if (!t) return '';
+      if (/(확대|증가|매수|신규|increase|add|buy|new)/.test(t)) return '확대';
+      if (/(축소|감소|매도|청산|decrease|reduce|trim|sell|exit)/.test(t)) return '축소';
+      if (/(유지|hold|same|keep)/.test(t)) return '유지';
+      return '';
+    }
+
+    function inferActionByChange(changeValue) {
+      const t = String(changeValue ?? '').trim();
+      if (!t) return '유지';
+      if (/^new$/i.test(t)) return '확대';
+      const num = Number(t.replace('%', '').replace('+', '').replace(/,/g, ''));
+      if (Number.isFinite(num)) {
+        if (num > 0) return '확대';
+        if (num < 0) return '축소';
+        return '유지';
+      }
+      return '유지';
+    }
+
+    function formatChangeValue(value) {
+      if (value === null || value === undefined) return '';
+      if (typeof value === 'string') {
+        const t = value.trim();
+        if (!t) return '';
+        if (/^new$/i.test(t)) return 'NEW';
+
+        const hasPercent = t.includes('%');
+        const cleaned = t.replace(/%/g, '').replace(/,/g, '').trim();
+        const num = Number(cleaned);
+        if (!Number.isFinite(num)) return t;
+
+        const percentValue = hasPercent ? num : (Math.abs(num) <= 1 ? num * 100 : num);
+        const sign = percentValue > 0 ? '+' : '';
+        return `${sign}${percentValue.toFixed(2)}%`;
+      }
+
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        const percentValue = Math.abs(value) <= 1 ? value * 100 : value;
+        const sign = percentValue > 0 ? '+' : '';
+        return `${sign}${percentValue.toFixed(2)}%`;
+      }
+
+      return String(value);
+    }
+
+    function formatWeightValue(value) {
+      if (value === null || value === undefined) return '';
+      if (typeof value === 'string') {
+        const t = value.trim();
+        if (!t) return '';
+        const cleaned = t.replace(/%/g, '').replace(/,/g, '').trim();
+        const num = Number(cleaned);
+        if (!Number.isFinite(num)) return t;
+        const percentValue = t.includes('%') ? num : (Math.abs(num) <= 1 ? num * 100 : num);
+        return `${percentValue.toFixed(2)}%`;
+      }
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        const percentValue = Math.abs(value) <= 1 ? value * 100 : value;
+        return `${percentValue.toFixed(2)}%`;
+      }
+      return String(value);
+    }
+
+    function normalizeTickerAndNote(tickerRaw, noteRaw) {
+      const tickerUpper = String(tickerRaw ?? '').trim().toUpperCase();
+      let note = String(noteRaw ?? '').trim();
+      if (!tickerUpper) return { ticker: '', note };
+
+      const compact = tickerUpper.replace(/\s+/g, '');
+      const callMatch = compact.match(/^([A-Z0-9.\-]+?)(?:[-_/]?)CALL$/);
+      const putMatch = compact.match(/^([A-Z0-9.\-]+?)(?:[-_/]?)PUT$/);
+
+      if (callMatch) {
+        const baseTicker = callMatch[1];
+        note = note ? `${note} / 콜옵션` : '콜옵션';
+        return { ticker: `${baseTicker} (CALL)`, note };
+      }
+      if (putMatch) {
+        const baseTicker = putMatch[1];
+        note = note ? `${note} / 풋옵션` : '풋옵션';
+        return { ticker: `${baseTicker} (PUT)`, note };
+      }
+
+      return { ticker: tickerUpper, note };
+    }
+
+    function translateSectorToKo(value) {
+      const raw = String(value ?? '').trim();
+      if (!raw) return '';
+      const normalized = raw
+        .toLowerCase()
+        .replace(/[()]/g, ' ')
+        .replace(/[_-]+/g, ' ')
+        .replace(/[&,/]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (sectorMapKo[normalized]) return sectorMapKo[normalized];
+
+      for (const rule of sectorKeywordRules) {
+        if (rule.keywords.some(k => normalized.includes(k))) return rule.ko;
+      }
+      return raw;
+    }
+
+    function toRecords(aoa) {
+      if (!aoa.length) return [];
+      const header = aoa[0];
+      const idxSector = findHeader(header, alias.sector);
+      const idxTicker = findHeader(header, alias.ticker);
+      const idxWeight = findHeader(header, alias.weight);
+      const idxChange = findHeader(header, alias.change);
+      const idxNote = findHeader(header, alias.note);
+      const idxAction = findHeader(header, alias.action);
+
+      if (idxSector < 0 || idxTicker < 0) {
+        throw new Error('헤더를 찾을 수 없습니다. 최소한 "섹터"와 "티커" 열이 필요합니다.');
+      }
+
+      const out = [];
+      for (let i = 1; i < aoa.length; i += 1) {
+        const row = aoa[i] || [];
+        const sector = translateSectorToKo(row[idxSector]);
+        const tickerRaw = row[idxTicker];
+        const weight = idxWeight >= 0 ? formatWeightValue(row[idxWeight]) : '';
+        const change = idxChange >= 0 ? formatChangeValue(row[idxChange]) : '';
+        const noteRaw = idxNote >= 0 ? row[idxNote] : '';
+        const { ticker, note } = normalizeTickerAndNote(tickerRaw, noteRaw);
+        if (!sector || !ticker) continue;
+
+        const actionRaw = idxAction >= 0 ? row[idxAction] : '';
+        const action = normalizeAction(actionRaw) || inferActionByChange(change);
+        out.push({ sector, ticker, weight, change, note, action });
+      }
+      return out;
+    }
+
+    function groupBySector(records) {
+      const order = ['확대', '축소', '유지'];
+      const sectors = new Map();
+      for (const r of records) {
+        if (!sectors.has(r.sector)) {
+          sectors.set(r.sector, { 확대: [], 축소: [], 유지: [] });
+        }
+        sectors.get(r.sector)[order.includes(r.action) ? r.action : '유지'].push(r);
+      }
+      return sectors;
+    }
+
+    function buildWideRows(sectorMap) {
+      const rows = [];
+      sectorMap.forEach((bucket, sector) => {
+        const maxLen = Math.max(bucket.확대.length, bucket.축소.length, bucket.유지.length, 1);
+        for (let i = 0; i < maxLen; i += 1) {
+          const u = bucket.확대[i] || {};
+          const d = bucket.축소[i] || {};
+          const h = bucket.유지[i] || {};
+          rows.push({
+            섹터: i === 0 ? sector : '',
+            지분확대티커: u.ticker || '',
+            확대비중: u.weight || '',
+            확대변화: u.change || '',
+            확대비고: u.note || '',
+            지분축소티커: d.ticker || '',
+            축소비중: d.weight || '',
+            축소변화: d.change || '',
+            축소비고: d.note || '',
+            유지티커: h.ticker || '',
+            유지비중: h.weight || '',
+            유지비고: h.note || '',
+            _sectorStart: i === 0
+          });
+        }
+      });
+      return rows;
+    }
+
+    function renderPreview(rows) {
+      previewBody.innerHTML = '';
+      rows.forEach((r, idx) => {
+        const tr = document.createElement('tr');
+        if (r._sectorStart && idx !== 0) tr.className = 'sector-sep';
+        tr.innerHTML = `
+          <td>${r.섹터}</td>
+          <td class="up"><b>${r.지분확대티커}</b></td>
+          <td class="up">${r.확대비중}</td>
+          <td class="up">${r.확대변화}</td>
+          <td class="up">${r.확대비고}</td>
+          <td class="down"><b>${r.지분축소티커}</b></td>
+          <td class="down">${r.축소비중}</td>
+          <td class="down">${r.축소변화}</td>
+          <td class="down">${r.축소비고}</td>
+          <td class="hold"><b>${r.유지티커}</b></td>
+          <td class="hold">${r.유지비중}</td>
+          <td class="hold">${r.유지비고}</td>
+        `;
+        previewBody.appendChild(tr);
+      });
+    }
+
+    function buildWorkbook(records, wideRows) {
+      const wb = XLSX.utils.book_new();
+
+      const summary = records.map(r => ({
+        섹터: r.sector,
+        구분: r.action,
+        티커: r.ticker,
+        '포트비중(W%)': r.weight,
+        '%변화': r.change,
+        비고: r.note
+      }));
+
+      const wsSummary = XLSX.utils.json_to_sheet(summary);
+      XLSX.utils.book_append_sheet(wb, wsSummary, '정리결과');
+
+      const previewHeader = [
+        '섹터',
+        '지분 확대(티커)', '포트 비중(W%)', '% 변화(Δ%)', '비고',
+        '지분 축소(티커)', '포트 비중(W%)', '% 변화(Δ%)', '비고',
+        '유지(티커)', '포트 비중(W%)', '비고'
+      ];
+      const previewRows = wideRows.map(r => ([
+        r.섹터,
+        r.지분확대티커, r.확대비중, r.확대변화, r.확대비고,
+        r.지분축소티커, r.축소비중, r.축소변화, r.축소비고,
+        r.유지티커, r.유지비중, r.유지비고
+      ]));
+      const wsPreview = XLSX.utils.aoa_to_sheet([previewHeader, ...previewRows]);
+      wsPreview['!cols'] = [
+        { wch: 12 },
+        { wch: 16 }, { wch: 12 }, { wch: 10 }, { wch: 28 },
+        { wch: 16 }, { wch: 12 }, { wch: 10 }, { wch: 28 },
+        { wch: 14 }, { wch: 12 }, { wch: 28 }
+      ];
+      XLSX.utils.book_append_sheet(wb, wsPreview, '미리보기형식');
+
+      return wb;
+    }
+
+    async function buildStyledWorkbookBuffer(records, wideRows) {
+      const wb = new ExcelJS.Workbook();
+      const wsSummary = wb.addWorksheet('정리결과');
+      const wsPreview = wb.addWorksheet('미리보기형식');
+
+      wsSummary.columns = [
+        { header: '섹터', key: 'sector', width: 14 },
+        { header: '구분', key: 'action', width: 10 },
+        { header: '티커', key: 'ticker', width: 16 },
+        { header: '포트비중(W%)', key: 'weight', width: 14 },
+        { header: '%변화', key: 'change', width: 12 },
+        { header: '비고', key: 'note', width: 32 }
+      ];
+      records.forEach(r => wsSummary.addRow({
+        sector: r.sector,
+        action: r.action,
+        ticker: r.ticker,
+        weight: r.weight,
+        change: r.change,
+        note: r.note
+      }));
+
+      const header = [
+        '섹터',
+        '지분 확대(티커)', '포트 비중(W%)', '% 변화(Δ%)', '비고',
+        '지분 축소(티커)', '포트 비중(W%)', '% 변화(Δ%)', '비고',
+        '유지(티커)', '포트 비중(W%)', '비고'
+      ];
+      wsPreview.addRow(header);
+      wideRows.forEach(r => {
+        wsPreview.addRow([
+          r.섹터,
+          r.지분확대티커, r.확대비중, r.확대변화, r.확대비고,
+          r.지분축소티커, r.축소비중, r.축소변화, r.축소비고,
+          r.유지티커, r.유지비중, r.유지비고
+        ]);
+      });
+      wsPreview.columns = [
+        { width: 12 },
+        { width: 16 }, { width: 12 }, { width: 10 }, { width: 30 },
+        { width: 16 }, { width: 12 }, { width: 10 }, { width: 30 },
+        { width: 14 }, { width: 12 }, { width: 28 }
+      ];
+
+      const fillHead = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF2F2F2' } };
+      const fillUp = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F5E9' } };
+      const fillDown = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFEBEE' } };
+      const fillHold = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFDE7' } };
+      const thin = { style: 'thin', color: { argb: 'FF222222' } };
+      const medium = { style: 'medium', color: { argb: 'FF000000' } };
+
+      wsSummary.eachRow((row, rowNumber) => {
+        row.eachCell(cell => {
+          cell.border = { top: thin, left: thin, bottom: thin, right: thin };
+          if (rowNumber === 1) {
+            cell.fill = fillHead;
+            cell.font = { bold: true };
+          }
+        });
+      });
+
+      wsPreview.eachRow((row, rowNumber) => {
+        row.eachCell((cell, col) => {
+          const isHeader = rowNumber === 1;
+          cell.alignment = { vertical: 'top', horizontal: 'center', wrapText: true };
+          cell.border = { top: thin, left: thin, bottom: thin, right: thin };
+          if (isHeader) {
+            cell.fill = fillHead;
+            cell.font = { bold: true };
+          } else if (col >= 2 && col <= 5) {
+            cell.fill = fillUp;
+          } else if (col >= 6 && col <= 9) {
+            cell.fill = fillDown;
+          } else if (col >= 10 && col <= 12) {
+            cell.fill = fillHold;
+          }
+
+          if ([1, 2, 6, 10].includes(col)) cell.border = { ...cell.border, left: medium };
+          if (col === 12) cell.border = { ...cell.border, right: medium };
+        });
+
+        if (rowNumber > 2 && wideRows[rowNumber - 2]?._sectorStart) {
+          for (let c = 1; c <= 12; c += 1) {
+            const cell = row.getCell(c);
+            cell.border = { ...cell.border, top: medium };
+          }
+        }
+      });
+
+      return wb.xlsx.writeBuffer();
+    }
+
+    fileInput.addEventListener('change', async (e) => {
+      const f = e.target.files?.[0];
+      if (!f) return;
+      try {
+        const data = await f.arrayBuffer();
+        const wb = XLSX.read(data, { type: 'array' });
+        const first = wb.SheetNames[0];
+        const aoa = XLSX.utils.sheet_to_json(wb.Sheets[first], { header: 1, defval: '' });
+
+        const records = toRecords(aoa);
+        const grouped = groupBySector(records);
+        const wideRows = buildWideRows(grouped);
+
+        renderPreview(wideRows);
+        currentWorkbook = buildWorkbook(records, wideRows);
+        currentPayload = { records, wideRows };
+        downloadBtn.disabled = false;
+      } catch (err) {
+        alert(`파일 처리 중 오류가 발생했습니다: ${err.message}`);
+        downloadBtn.disabled = true;
+        currentWorkbook = null;
+        currentPayload = null;
+      }
+    });
+
+    downloadBtn.addEventListener('click', async () => {
+      if (!currentWorkbook || !currentPayload) return;
+      const stamp = new Date().toISOString().slice(0, 10);
+      try {
+        if (typeof ExcelJS !== 'undefined') {
+          const buffer = await buildStyledWorkbookBuffer(currentPayload.records, currentPayload.wideRows);
+          const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `13f_정리_${stamp}.xlsx`;
+          a.click();
+          URL.revokeObjectURL(url);
+          return;
+        }
+      } catch (err) {
+        console.warn('스타일 엑셀 생성 실패, 기본 생성으로 대체합니다.', err);
+      }
+      XLSX.writeFile(currentWorkbook, `13f_정리_${stamp}.xlsx`);
+    });
+  </script>
+</body>
+</html>
